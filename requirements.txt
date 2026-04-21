@@ -1,0 +1,6 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+earthengine-api==1.6.12
+google-auth==2.39.0
+pandas==2.2.3
+requests==2.32.3
