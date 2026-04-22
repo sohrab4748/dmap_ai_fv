@@ -226,18 +226,15 @@ def _open_thredds_dataset(url: str):
         import xarray as xr
     except Exception as exc:
         raise RuntimeError(
-            "xarray is required for forecast download. Install xarray and pydap in the backend environment."
+            "xarray is required for forecast download. Install xarray, pydap, and Jinja2 in the backend environment."
         ) from exc
 
-    errors: List[str] = []
-    for engine in ("pydap", None):
-        try:
-            if engine is None:
-                return xr.open_dataset(url, decode_times=False)
-            return xr.open_dataset(url, engine=engine, decode_times=False)
-        except Exception as exc:
-            errors.append(f"engine={engine or 'default'}: {exc}")
-    raise RuntimeError(f"Could not open THREDDS dataset {url}. Errors: {' | '.join(errors)}")
+    try:
+        return xr.open_dataset(url, engine="pydap", decode_times=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not open THREDDS dataset with pydap: {url}. Error: {exc}"
+        ) from exc
 
 
 def _parse_http_datetime(value: Optional[str]) -> Optional[datetime]:
