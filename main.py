@@ -1,6 +1,6 @@
 import json
-import os
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -13,17 +13,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.oauth2 import service_account
 from pydantic import BaseModel, Field
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "dmapaifv")
 GEE_SERVICE_ACCOUNT_JSON = os.getenv("GEE_SERVICE_ACCOUNT_JSON", "").strip()
 CLIMATE_ENGINE_API_KEY = os.getenv("CLIMATE_ENGINE_API_KEY", "").strip()
-CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]
+
+_raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
+if _raw_origins == "*":
+    CORS_ALLOW_ORIGINS = ["*"]
+else:
+    CORS_ALLOW_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 WEATHER_BANDS = [
     "pr", "tmmx", "tmmn", "eto", "vpd", "vs", "srad", "rmax", "rmin", "sph"
@@ -33,6 +37,7 @@ DROUGHT_BANDS = [
     "spi14d", "spi30d", "spi90d",
     "pdsi", "z"
 ]
+
 FORECAST_VARIABLES = ["eddi", "pr", "tmmx", "tmmn", "eto"]
 FORECAST_WEEKS = [
     ("week1", "day01", "day07"),
@@ -44,8 +49,8 @@ FORECAST_WEEKS = [
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS if CORS_ALLOW_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False if CORS_ALLOW_ORIGINS == ["*"] else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -70,8 +75,8 @@ class FVPointResponse(BaseModel):
     weather_daily: Optional[List[Dict[str, Any]]] = None
     drought_latest: Optional[Dict[str, Any]] = None
     noaa_monitoring: Optional[Dict[str, Any]] = None
-    forecast_4week: Optional[List[Dict[str, Any]]] = None
-    warnings: List[str] = []
+    forecast_4week: Optional[Dict[str, Any]] = None
+    warnings: List[str] = Field(default_factory=list)
 
 
 def _normalize_climate_engine_key(value: str) -> str:
@@ -81,10 +86,22 @@ def _normalize_climate_engine_key(value: str) -> str:
     return key
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def initialize_earth_engine() -> None:
     global _GEE_INITIALIZED, _GEE_INIT_ERROR
     if _GEE_INITIALIZED:
         return
+
     try:
         if GEE_SERVICE_ACCOUNT_JSON:
             info = json.loads(GEE_SERVICE_ACCOUNT_JSON)
@@ -98,9 +115,10 @@ def initialize_earth_engine() -> None:
             creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
             ee.Initialize(creds, project=GEE_PROJECT_ID)
             logger.info("Earth Engine initialized with ADC for project %s", GEE_PROJECT_ID)
+
         _GEE_INITIALIZED = True
         _GEE_INIT_ERROR = None
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         _GEE_INITIALIZED = False
         _GEE_INIT_ERROR = str(exc)
         logger.exception("Earth Engine initialization failed")
@@ -112,7 +130,6 @@ def on_startup() -> None:
     try:
         initialize_earth_engine()
     except Exception:
-        # Keep app alive so /health can surface the error.
         pass
 
 
@@ -123,7 +140,8 @@ def root() -> Dict[str, Any]:
         "version": APP_VERSION,
         "gee_project_id": GEE_PROJECT_ID,
         "gee_initialized": _GEE_INITIALIZED,
-        "forecast_provider": "Climate Engine" if _normalize_climate_engine_key(CLIMATE_ENGINE_API_KEY) else None,
+        "climate_engine_configured": bool(_normalize_climate_engine_key(CLIMATE_ENGINE_API_KEY)),
+        "forecast_provider": "Climate Engine CFS_GRIDMET" if _normalize_climate_engine_key(CLIMATE_ENGINE_API_KEY) else None,
     }
 
 
@@ -133,6 +151,7 @@ def health() -> Dict[str, Any]:
         "status": "ok" if _GEE_INITIALIZED else "degraded",
         "gee_initialized": _GEE_INITIALIZED,
         "gee_error": _GEE_INIT_ERROR,
+        "climate_engine_configured": bool(_normalize_climate_engine_key(CLIMATE_ENGINE_API_KEY)),
     }
 
 
@@ -192,10 +211,8 @@ def _point_geometry(lat: float, lon: float) -> ee.Geometry:
 
 
 def _kelvin_to_celsius(v: Any) -> Optional[float]:
-    try:
-        return round(float(v) - 273.15, 3)
-    except Exception:
-        return None
+    x = _coerce_float(v)
+    return None if x is None else round(x - 273.15, 3)
 
 
 def extract_weather_timeseries(lat: float, lon: float, history_days: int) -> List[Dict[str, Any]]:
@@ -311,15 +328,260 @@ def _flatten_climate_engine_payload(payload: Any, variable: str, week_name: str,
     return rows
 
 
-def fetch_climate_engine_forecast(lat: float, lon: float, api_key: str) -> List[Dict[str, Any]]:
+def _date_from_row(row: Dict[str, Any]) -> Optional[str]:
+    for key in ["date", "Date", "time", "Time", "valid_time", "Valid Time", "datetime"]:
+        if key in row and row[key] is not None:
+            return str(row[key])
+    return None
+
+
+def _numeric_candidates(row: Dict[str, Any]) -> Dict[str, float]:
+    ignore = {
+        "variable", "week", "start_day", "end_day",
+        "date", "Date", "time", "Time", "valid_time", "Valid Time",
+        "model", "Model", "dataset", "Dataset", "geometry", "coordinates",
+        "id", "name", "Name", "lat", "lon"
+    }
+    out: Dict[str, float] = {}
+    for key, value in row.items():
+        if key in ignore:
+            continue
+        fv = _coerce_float(value)
+        if fv is not None:
+            out[key] = fv
+    return out
+
+
+def _best_value_for_variable(variable: str, row: Dict[str, Any]) -> Optional[float]:
+    candidates = _numeric_candidates(row)
+    if not candidates:
+        return None
+
+    preference = {
+        "pr": ["pr", "value", "Value", "sum", "Sum", "mean", "Mean"],
+        "tmmx": ["tmmx", "value", "Value", "mean", "Mean"],
+        "tmmn": ["tmmn", "value", "Value", "mean", "Mean"],
+        "eto": ["eto", "value", "Value", "sum", "Sum", "mean", "Mean"],
+        "eddi": ["eddi", "value", "Value", "mean", "Mean"],
+    }.get(variable, ["value", "Value", variable])
+
+    for key in preference:
+        if key in candidates:
+            return candidates[key]
+
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+
+    for key, value in candidates.items():
+        if variable.lower() in key.lower():
+            return value
+
+    return next(iter(candidates.values()))
+
+
+def _summarize_week_variable(variable: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    values = []
+    dates = []
+    for row in rows:
+        v = _best_value_for_variable(variable, row)
+        if v is not None:
+            values.append(v)
+        d = _date_from_row(row)
+        if d:
+            dates.append(d)
+
+    result: Dict[str, Any] = {
+        "variable": variable,
+        "records": len(rows),
+        "dates": dates,
+    }
+
+    if not values:
+        result["value"] = None
+        return result
+
+    if variable == "pr":
+        result["value"] = round(sum(values), 3)
+        result["metric"] = "pr_total_mm"
+    elif variable == "eto":
+        result["value"] = round(sum(values), 3)
+        result["metric"] = "eto_total_mm"
+    elif variable == "tmmx":
+        result["value_k"] = round(sum(values) / len(values), 3)
+        result["value"] = round((sum(values) / len(values)) - 273.15, 3)
+        result["metric"] = "tmmx_mean_c"
+    elif variable == "tmmn":
+        result["value_k"] = round(sum(values) / len(values), 3)
+        result["value"] = round((sum(values) / len(values)) - 273.15, 3)
+        result["metric"] = "tmmn_mean_c"
+    elif variable == "eddi":
+        result["value"] = round(sum(values) / len(values), 3)
+        result["metric"] = "eddi"
+    else:
+        result["value"] = round(sum(values) / len(values), 3)
+        result["metric"] = f"{variable}_value"
+
+    return result
+
+
+def _build_weekly_summary(all_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    summary: List[Dict[str, Any]] = []
+
+    for week_name, start_day, end_day in FORECAST_WEEKS:
+        week_rows = [r for r in all_rows if r.get("week") == week_name]
+        item: Dict[str, Any] = {
+            "week": week_name,
+            "start_day": start_day,
+            "end_day": end_day,
+            "raw_row_count": len(week_rows),
+        }
+
+        week_dates: List[str] = []
+        for variable in FORECAST_VARIABLES:
+            var_rows = [r for r in week_rows if r.get("variable") == variable]
+            s = _summarize_week_variable(variable, var_rows)
+
+            if variable == "pr":
+                item["pr_total_mm"] = s.get("value")
+            elif variable == "eto":
+                item["eto_total_mm"] = s.get("value")
+            elif variable == "tmmx":
+                item["tmmx_mean_c"] = s.get("value")
+                item["tmmx_mean_k"] = s.get("value_k")
+            elif variable == "tmmn":
+                item["tmmn_mean_c"] = s.get("value")
+                item["tmmn_mean_k"] = s.get("value_k")
+            elif variable == "eddi":
+                item["eddi"] = s.get("value")
+
+            week_dates.extend(s.get("dates", []))
+
+        week_dates = sorted({d for d in week_dates if d})
+        item["dates"] = week_dates
+        item["date_start"] = week_dates[0] if week_dates else None
+        item["date_end"] = week_dates[-1] if week_dates else None
+
+        pr_total = _coerce_float(item.get("pr_total_mm"))
+        eto_total = _coerce_float(item.get("eto_total_mm"))
+        if pr_total is not None and eto_total is not None:
+            item["precip_minus_eto_mm"] = round(pr_total - eto_total, 3)
+        else:
+            item["precip_minus_eto_mm"] = None
+
+        summary.append(item)
+
+    return summary
+
+
+def _classify_forecast_week(item: Dict[str, Any], prev_eddi: Optional[float]) -> Dict[str, Any]:
+    eddi = _coerce_float(item.get("eddi"))
+    pr_total = _coerce_float(item.get("pr_total_mm"))
+    eto_total = _coerce_float(item.get("eto_total_mm"))
+    balance = _coerce_float(item.get("precip_minus_eto_mm"))
+
+    score = 0
+    reasons: List[str] = []
+
+    if eddi is not None:
+        if eddi >= 1.5:
+            score += 3
+            reasons.append("very high EDDI")
+        elif eddi >= 1.0:
+            score += 2
+            reasons.append("high EDDI")
+        elif eddi >= 0.5:
+            score += 1
+            reasons.append("moderately positive EDDI")
+        elif eddi <= -1.0:
+            score -= 1
+            reasons.append("negative EDDI")
+
+    if eto_total is not None:
+        if eto_total >= 28:
+            score += 2
+            reasons.append("high weekly ETo demand")
+        elif eto_total >= 21:
+            score += 1
+            reasons.append("elevated weekly ETo demand")
+
+    if pr_total is not None:
+        if pr_total <= 2:
+            score += 2
+            reasons.append("very low forecast precipitation")
+        elif pr_total <= 7:
+            score += 1
+            reasons.append("low forecast precipitation")
+        elif pr_total >= 20:
+            score -= 1
+            reasons.append("helpful forecast precipitation")
+
+    if balance is not None:
+        if balance < -20:
+            score += 2
+            reasons.append("precipitation far below ETo")
+        elif balance < -10:
+            score += 1
+            reasons.append("precipitation below ETo")
+        elif balance > 10:
+            score -= 1
+            reasons.append("precipitation exceeds ETo")
+
+    if score >= 6:
+        risk = "severe"
+    elif score >= 4:
+        risk = "high"
+    elif score >= 2:
+        risk = "moderate"
+    else:
+        risk = "low"
+
+    trend = None
+    if prev_eddi is not None and eddi is not None:
+        delta = round(eddi - prev_eddi, 3)
+        if delta >= 0.5:
+            trend = "drying is strengthening"
+        elif delta <= -0.5:
+            trend = "drying pressure is easing"
+        else:
+            trend = "little change in EDDI"
+    else:
+        delta = None
+
+    return {
+        "week": item.get("week"),
+        "eddi": eddi,
+        "pr_total_mm": pr_total,
+        "eto_total_mm": eto_total,
+        "precip_minus_eto_mm": balance,
+        "risk_score": score,
+        "risk_level": risk,
+        "eddi_change_from_previous_week": delta,
+        "trend_note": trend,
+        "reasons": reasons,
+    }
+
+
+def _build_forecast_analysis(weekly_summary: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    prev_eddi: Optional[float] = None
+    for item in weekly_summary:
+        analysis = _classify_forecast_week(item, prev_eddi)
+        out.append(analysis)
+        prev_eddi = _coerce_float(item.get("eddi"))
+    return out
+
+
+def fetch_climate_engine_forecast(lat: float, lon: float, api_key: str) -> Dict[str, Any]:
     url = "https://api.climateengine.org/timeseries/native/forecasts/coordinates"
     headers = {
         "Authorization": api_key,
         "Accept": "application/json",
-        "User-Agent": "dmap-ai-fv-backend/1.0",
+        "User-Agent": "dmap-ai-fv-backend/2.0",
     }
 
     all_rows: List[Dict[str, Any]] = []
+    request_log: List[Dict[str, Any]] = []
+
     for variable in FORECAST_VARIABLES:
         for week_name, start_day, end_day in FORECAST_WEEKS:
             params = {
@@ -335,15 +597,28 @@ def fetch_climate_engine_forecast(lat: float, lon: float, api_key: str) -> List[
             if r.status_code == 401:
                 raise HTTPException(status_code=500, detail="Climate Engine API key is invalid.")
             r.raise_for_status()
+
             payload = r.json()
             rows = _flatten_climate_engine_payload(payload, variable, week_name, start_day, end_day)
             all_rows.extend(rows)
+            request_log.append({
+                "variable": variable,
+                "week": week_name,
+                "start_day": start_day,
+                "end_day": end_day,
+                "rows_returned": len(rows),
+            })
 
-    # Normalize row keys across variables for easier frontend use.
-    if not all_rows:
-        return []
+    weekly_summary = _build_weekly_summary(all_rows)
+    analysis = _build_forecast_analysis(weekly_summary)
 
-    df = pd.DataFrame(all_rows)
-    if df.empty:
-        return []
-    return df.where(pd.notnull(df), None).to_dict(orient="records")
+    return {
+        "provider": "Climate Engine",
+        "dataset": "CFS_GRIDMET",
+        "model": "ens_mean",
+        "requested_variables": FORECAST_VARIABLES,
+        "request_log": request_log,
+        "weekly_summary": weekly_summary,
+        "analysis": analysis,
+        "raw_records": pd.DataFrame(all_rows).where(pd.notnull(pd.DataFrame(all_rows)), None).to_dict(orient="records") if all_rows else [],
+    }
