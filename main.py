@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.4.1-gee-only-cfsv2-runfix"
+APP_VERSION = "0.4.2-gee-only-cfsv2-nullsafe"
 
 GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "dmapaifv")
 GEE_SERVICE_ACCOUNT_JSON = os.getenv("GEE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -554,7 +554,25 @@ def extract_forecast_4week(lat: float, lon: float) -> Dict[str, Any]:
     point = _point_geometry(lat, lon)
     warnings: List[str] = []
 
-    ic = ee.ImageCollection("NOAA/CFSV2/FOR6H_HARMONIZED").select(CFS_BANDS)
+    today = datetime.utcnow().date()
+    search_start = today - timedelta(days=3)
+    search_end = today + timedelta(days=MAX_FORECAST_DAYS + 3)
+
+    ic = (
+        ee.ImageCollection("NOAA/CFSV2/FOR6H_HARMONIZED")
+        .filterDate(str(search_start), str(search_end))
+        .filter(ee.Filter.notNull(["start_hour", "end_hour"]))
+        .select(CFS_BANDS)
+    )
+
+    collection_size = ic.size().getInfo()
+    if not collection_size:
+        return {
+            "provider": "NOAA/CFSV2/FOR6H_HARMONIZED",
+            "status": "no_data",
+            "message": "No CFSv2 forecast images were found in the recent search window.",
+            "warnings": ["Forecast block is empty because no recent CFSv2 forecast images were available in GEE."],
+        }
 
     def add_run_properties(img):
         valid_start = ee.Date(img.get("system:time_start"))
