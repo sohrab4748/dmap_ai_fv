@@ -1,41 +1,25 @@
-import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
-import ee
-import google.auth
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google.oauth2 import service_account
 from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.4.0-gee-thredds-eddi"
-
-GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "dmapaifv")
-GEE_SERVICE_ACCOUNT_JSON = os.getenv("GEE_SERVICE_ACCOUNT_JSON", "").strip()
+APP_VERSION = "0.5.0-thredds-eddi-no-gee"
 
 _raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
 if _raw_origins == "*":
     CORS_ALLOW_ORIGINS = ["*"]
 else:
     CORS_ALLOW_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-
-WEATHER_BANDS = [
-    "pr", "tmmx", "tmmn", "eto", "vpd", "vs", "srad", "rmax", "rmin", "sph"
-]
-DROUGHT_BANDS = [
-    "eddi14d", "eddi30d", "eddi90d",
-    "spi14d", "spi30d", "spi90d",
-    "pdsi", "z"
-]
 
 FORECAST_PERIODS_ALL = ["wk1", "wk2", "wk3", "wk4", "wk12", "wk34", "wk123", "wk1234"]
 FORECAST_PERIOD_FILES = {
@@ -78,9 +62,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-_GEE_INITIALIZED = False
-_GEE_INIT_ERROR: Optional[str] = None
 
 
 class FVPointRequest(BaseModel):
@@ -125,51 +106,15 @@ class FVPointResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
 
 
-def initialize_earth_engine() -> None:
-    global _GEE_INITIALIZED, _GEE_INIT_ERROR
-    if _GEE_INITIALIZED:
-        return
-
-    try:
-        if GEE_SERVICE_ACCOUNT_JSON:
-            info = json.loads(GEE_SERVICE_ACCOUNT_JSON)
-            creds = service_account.Credentials.from_service_account_info(
-                info,
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            ee.Initialize(creds, project=GEE_PROJECT_ID)
-            logger.info("Earth Engine initialized with service account for project %s", GEE_PROJECT_ID)
-        else:
-            creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            ee.Initialize(creds, project=GEE_PROJECT_ID)
-            logger.info("Earth Engine initialized with ADC for project %s", GEE_PROJECT_ID)
-
-        _GEE_INITIALIZED = True
-        _GEE_INIT_ERROR = None
-    except Exception as exc:
-        _GEE_INITIALIZED = False
-        _GEE_INIT_ERROR = str(exc)
-        logger.exception("Earth Engine initialization failed")
-        raise
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    try:
-        initialize_earth_engine()
-    except Exception:
-        pass
-
-
 @app.get("/")
 def root() -> Dict[str, Any]:
     return {
         "app": APP_TITLE,
         "version": APP_VERSION,
-        "gee_project_id": GEE_PROJECT_ID,
-        "gee_initialized": _GEE_INITIALIZED,
+        "gee_initialized": False,
+        "gee_enabled": False,
         "forecast_provider": "official-thredds-eddi",
-        "backend_mode": "gee-plus-thredds-eddi",
+        "backend_mode": "thredds-eddi-no-gee",
         "supported_forecast_periods": FORECAST_PERIODS_ALL,
     }
 
@@ -177,10 +122,11 @@ def root() -> Dict[str, Any]:
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {
-        "status": "ok" if _GEE_INITIALIZED else "degraded",
-        "gee_initialized": _GEE_INITIALIZED,
-        "gee_error": _GEE_INIT_ERROR,
-        "backend_mode": "gee-plus-thredds-eddi",
+        "status": "ok",
+        "gee_initialized": False,
+        "gee_enabled": False,
+        "gee_error": None,
+        "backend_mode": "thredds-eddi-no-gee",
         "forecast_provider": "official-thredds-eddi",
         "forecast_periods_supported": FORECAST_PERIODS_ALL,
     }
@@ -188,13 +134,6 @@ def health() -> Dict[str, Any]:
 
 @app.post("/fv/point", response_model=FVPointResponse)
 def fv_point(req: FVPointRequest) -> FVPointResponse:
-    initialize_earth_engine()
-    if not _GEE_INITIALIZED:
-        raise HTTPException(status_code=500, detail=f"Earth Engine not initialized: {_GEE_INIT_ERROR}")
-
-    workload_tag = req.workload_tag or "fv-point-request-ui"
-    ee.data.setDefaultWorkloadTag(workload_tag)
-
     warnings: List[str] = []
     weather_daily = None
     drought_latest = None
@@ -203,10 +142,14 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
 
     try:
         if req.include_weather_history:
-            weather_daily = extract_weather_timeseries(req.lat, req.lon, req.history_days)
+            warnings.append(
+                "Weather history is not included in this backend because GEE has been removed."
+            )
 
         if req.include_drought_latest:
-            drought_latest = extract_latest_drought(req.lat, req.lon)
+            warnings.append(
+                "Latest drought indices are not included in this backend because GEE has been removed."
+            )
 
         if req.include_noaa_monitoring:
             noaa_monitoring = fetch_noaa_monitoring_eddi(req.lat, req.lon)
@@ -233,9 +176,8 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
             "lat": req.lat,
             "lon": req.lon,
             "history_days": req.history_days,
-            "gee_project_id": GEE_PROJECT_ID,
-            "workload_tag": workload_tag,
-            "backend_mode": "gee-plus-thredds-eddi",
+            "workload_tag": req.workload_tag,
+            "backend_mode": "thredds-eddi-no-gee",
             "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
         weather_daily=weather_daily,
@@ -244,77 +186,6 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
         forecast_4week=forecast_4week,
         warnings=warnings,
     )
-
-
-def _point_geometry(lat: float, lon: float) -> ee.Geometry:
-    return ee.Geometry.Point([lon, lat])
-
-
-def _coerce_float(v: Any) -> Optional[float]:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def _kelvin_to_celsius(v: Any) -> Optional[float]:
-    x = _coerce_float(v)
-    return None if x is None else round(x - 273.15, 3)
-
-
-def extract_weather_timeseries(lat: float, lon: float, history_days: int) -> List[Dict[str, Any]]:
-    point = _point_geometry(lat, lon)
-    end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=history_days)
-
-    ic = (
-        ee.ImageCollection("IDAHO_EPSCOR/GRIDMET")
-        .filterDate(str(start_date), str(end_date + timedelta(days=1)))
-        .select(WEATHER_BANDS)
-    )
-
-    def image_to_feature(img):
-        vals = img.reduceRegion(
-            reducer=ee.Reducer.first(),
-            geometry=point,
-            scale=4000,
-            maxPixels=1_000_000,
-        )
-        vals = vals.set("date", img.date().format("YYYY-MM-dd"))
-        return ee.Feature(None, vals)
-
-    fc = ee.FeatureCollection(ic.map(image_to_feature))
-    features = fc.getInfo().get("features", [])
-    rows = [feat.get("properties", {}) for feat in features]
-    rows.sort(key=lambda r: r.get("date", ""))
-
-    for row in rows:
-        if "tmmx" in row:
-            row["tmmx_c"] = _kelvin_to_celsius(row.get("tmmx"))
-        if "tmmn" in row:
-            row["tmmn_c"] = _kelvin_to_celsius(row.get("tmmn"))
-
-    return rows
-
-
-def extract_latest_drought(lat: float, lon: float) -> Dict[str, Any]:
-    point = _point_geometry(lat, lon)
-    ic = ee.ImageCollection("GRIDMET/DROUGHT").select(DROUGHT_BANDS)
-    latest = ic.sort("system:time_start", False).first()
-
-    values = latest.reduceRegion(
-        reducer=ee.Reducer.first(),
-        geometry=point,
-        scale=4000,
-        maxPixels=1_000_000,
-    ).getInfo()
-
-    image_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
-    out = {"date": image_date}
-    out.update(values or {})
-    return out
 
 
 def fetch_noaa_monitoring_eddi(lat: float, lon: float) -> Dict[str, Any]:
@@ -491,6 +362,8 @@ def extract_official_forecast_eddi(
                 "eddi_max": float(np.max(values_finite)) if n_finite else None,
                 "eddi_p25": float(np.percentile(values_finite, 25)) if n_finite else None,
                 "eddi_p75": float(np.percentile(values_finite, 75)) if n_finite else None,
+                "lat_req": lat,
+                "lon_req": lon,
                 "lat_grid": lat_grid,
                 "lon_grid": lon_grid,
             })
@@ -514,6 +387,8 @@ def extract_official_forecast_eddi(
                         "valid_end": valid_end,
                         "ensemble_member": idx,
                         "eddi": float(val) if np.isfinite(val) else None,
+                        "lat_req": lat,
+                        "lon_req": lon,
                         "lat_grid": lat_grid,
                         "lon_grid": lon_grid,
                     })
