@@ -1,9 +1,8 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.0
-earthengine-api==1.6.12
-google-auth==2.39.0
-requests==2.32.3
 pydantic==2.13.0
+requests==2.32.3
 xarray==2025.3.1
-pydap==3.5.5
+pydap==3.5.9
+Jinja2==3.1.6
 numpy==2.2.4
