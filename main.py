@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.4.0-gee-only-cfsv2"
+APP_VERSION = "0.4.1-gee-only-cfsv2-runfix"
 
 GEE_PROJECT_ID = os.getenv("GEE_PROJECT_ID", "dmapaifv")
 GEE_SERVICE_ACCOUNT_JSON = os.getenv("GEE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -293,6 +293,7 @@ def _derive_daily_cfs_step(props: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "date": (props.get("forecast_start_utc") or "")[:10],
+        "run_time_utc": props.get("run_time_utc"),
         "forecast_start_utc": props.get("forecast_start_utc"),
         "forecast_end_utc": props.get("forecast_end_utc"),
         "lead_start_hour": _coerce_float(props.get("start_hour")),
@@ -554,10 +555,26 @@ def extract_forecast_4week(lat: float, lon: float) -> Dict[str, Any]:
     warnings: List[str] = []
 
     ic = ee.ImageCollection("NOAA/CFSV2/FOR6H_HARMONIZED").select(CFS_BANDS)
-    latest = ic.sort("system:time_start", False).first()
-    latest_init = latest.get("system:time_start")
+
+    def add_run_properties(img):
+        valid_start = ee.Date(img.get("system:time_start"))
+        start_hour = ee.Number(img.get("start_hour"))
+        end_hour = ee.Number(img.get("end_hour"))
+        run_time = valid_start.advance(start_hour.multiply(-1), "hour")
+        step_hours = end_hour.subtract(start_hour)
+        forecast_end = valid_start.advance(step_hours, "hour")
+        return img.set({
+            "run_time_millis": run_time.millis(),
+            "run_time_utc": run_time.format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
+            "forecast_start_utc": valid_start.format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
+            "forecast_end_utc": forecast_end.format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
+        })
+
+    ic_with_run = ic.map(add_run_properties)
+    latest_run_img = ic_with_run.sort("run_time_millis", False).first()
+    latest_run_millis = latest_run_img.get("run_time_millis")
     latest_run = (
-        ic.filter(ee.Filter.eq("system:time_start", latest_init))
+        ic_with_run.filter(ee.Filter.eq("run_time_millis", latest_run_millis))
         .filter(ee.Filter.lte("start_hour", MAX_FORECAST_DAYS * 24))
         .sort("start_hour")
     )
@@ -569,18 +586,11 @@ def extract_forecast_4week(lat: float, lon: float) -> Dict[str, Any]:
             scale=22264,
             maxPixels=1_000_000,
         )
-        init_dt = ee.Date(img.get("system:time_start"))
-        vals = vals.set("run_time_utc", init_dt.format("YYYY-MM-dd'T'HH:mm:ss'Z'"))
+        vals = vals.set("run_time_utc", img.get("run_time_utc"))
         vals = vals.set("start_hour", ee.Number(img.get("start_hour")))
         vals = vals.set("end_hour", ee.Number(img.get("end_hour")))
-        vals = vals.set(
-            "forecast_start_utc",
-            init_dt.advance(ee.Number(img.get("start_hour")), "hour").format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
-        )
-        vals = vals.set(
-            "forecast_end_utc",
-            init_dt.advance(ee.Number(img.get("end_hour")), "hour").format("YYYY-MM-dd'T'HH:mm:ss'Z'"),
-        )
+        vals = vals.set("forecast_start_utc", img.get("forecast_start_utc"))
+        vals = vals.set("forecast_end_utc", img.get("forecast_end_utc"))
         return ee.Feature(None, vals)
 
     fc = ee.FeatureCollection(latest_run.map(image_to_feature))
@@ -592,8 +602,8 @@ def extract_forecast_4week(lat: float, lon: float) -> Dict[str, Any]:
         return {
             "provider": "NOAA/CFSV2/FOR6H_HARMONIZED",
             "status": "no_data",
-            "message": "No forecast images were returned for the latest CFSv2 run.",
-            "warnings": ["Forecast block is empty because the latest CFSv2 run returned no images."],
+            "message": "No forecast images were returned after grouping the latest CFSv2 initialization.",
+            "warnings": ["Forecast block is empty because the latest CFSv2 initialization returned no usable images."],
         }
 
     derived_steps = [_derive_daily_cfs_step(r) for r in step_rows if r.get("forecast_start_utc")]
