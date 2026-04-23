@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.6.0-thredds-eddi-farmer-risk"
+APP_VERSION = "0.6.1-thredds-eddi-farmer-risk-dap2"
 
 _raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
 if _raw_origins == "*":
@@ -53,6 +53,7 @@ FORECAST_BASE_FILESERVER = os.getenv(
     "NWCSC_INTEGRATED_SCENARIOS_ALL_CLIMATE/cfsv2_metdata_90day",
 ).rstrip("/")
 THREDDS_TIMEOUT_SECONDS = int(os.getenv("THREDDS_TIMEOUT_SECONDS", "90"))
+THREDDS_DAP_PROTOCOL = os.getenv("THREDDS_DAP_PROTOCOL", "dap2").strip().lower()
 
 SUPPORTED_CROPS = ["corn", "soybean"]
 CROP_STAGE_OPTIONS = {
@@ -100,16 +101,10 @@ DRY_THRESHOLD = float(os.getenv("EDDI_DRY_THRESHOLD", "-1.0"))
 SEVERE_DRY_THRESHOLD = float(os.getenv("EDDI_SEVERE_DRY_THRESHOLD", "-1.5"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
-origins = [
-    x.strip()
-    for x in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
-    if x.strip()
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=False if CORS_ALLOW_ORIGINS == ["*"] else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -193,6 +188,7 @@ def root() -> Dict[str, Any]:
         "supported_forecast_periods": FORECAST_PERIODS_ALL,
         "supported_crops": SUPPORTED_CROPS,
         "crop_stage_options": CROP_STAGE_OPTIONS,
+        "thredds_dap_protocol": THREDDS_DAP_PROTOCOL,
     }
 
 
@@ -207,6 +203,7 @@ def health() -> Dict[str, Any]:
         "forecast_provider": "official-thredds-eddi",
         "forecast_periods_supported": FORECAST_PERIODS_ALL,
         "supported_crops": SUPPORTED_CROPS,
+        "thredds_dap_protocol": THREDDS_DAP_PROTOCOL,
     }
 
 
@@ -327,6 +324,16 @@ def fetch_noaa_monitoring_eddi(lat: float, lon: float) -> Dict[str, Any]:
             out[name] = val
 
     return out
+
+
+def _to_explicit_dap_url(url: str) -> str:
+    if url.startswith("dap2://") or url.startswith("dap4://"):
+        return url
+    if THREDDS_DAP_PROTOCOL in {"dap2", "dap4"} and url.startswith("http://"):
+        return f"{THREDDS_DAP_PROTOCOL}://" + url[len("http://"):]
+    if THREDDS_DAP_PROTOCOL in {"dap2", "dap4"} and url.startswith("https://"):
+        return f"{THREDDS_DAP_PROTOCOL}://" + url[len("https://"):]
+    return url
 
 
 def _open_thredds_dataset(url: str):
@@ -477,6 +484,7 @@ def extract_official_forecast_eddi(
                 file_rows.append({
                     "period": period,
                     "url": url,
+                    "dap_url": _to_explicit_dap_url(url),
                     "filename": FORECAST_PERIOD_FILES[period],
                     "issue_date": issue_date_iso,
                     "valid_start": valid_start,
