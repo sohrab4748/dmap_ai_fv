@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.5.0-thredds-eddi-no-gee"
+APP_VERSION = "0.6.0-thredds-eddi-farmer-risk"
 
 _raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
 if _raw_origins == "*":
@@ -54,6 +54,51 @@ FORECAST_BASE_FILESERVER = os.getenv(
 ).rstrip("/")
 THREDDS_TIMEOUT_SECONDS = int(os.getenv("THREDDS_TIMEOUT_SECONDS", "90"))
 
+SUPPORTED_CROPS = ["corn", "soybean"]
+CROP_STAGE_OPTIONS = {
+    "corn": [
+        "planting_emergence",
+        "vegetative",
+        "tasseling_silking",
+        "grain_fill",
+        "maturity_late",
+    ],
+    "soybean": [
+        "planting_emergence",
+        "vegetative",
+        "flowering",
+        "pod_set_pod_fill",
+        "seed_fill",
+        "maturity_late",
+    ],
+}
+STAGE_SENSITIVITY = {
+    "corn": {
+        "planting_emergence": 1.0,
+        "vegetative": 1.1,
+        "tasseling_silking": 1.5,
+        "grain_fill": 1.3,
+        "maturity_late": 0.7,
+    },
+    "soybean": {
+        "planting_emergence": 1.0,
+        "vegetative": 1.0,
+        "flowering": 1.3,
+        "pod_set_pod_fill": 1.5,
+        "seed_fill": 1.3,
+        "maturity_late": 0.7,
+    },
+}
+STAGE_SENSITIVITY_LABELS = {
+    1.45: "very_high",
+    1.20: "high",
+    0.90: "moderate",
+    0.0: "low",
+}
+EDDI_DRY_DIRECTION = os.getenv("EDDI_DRY_DIRECTION", "negative").strip().lower()
+DRY_THRESHOLD = float(os.getenv("EDDI_DRY_THRESHOLD", "-1.0"))
+SEVERE_DRY_THRESHOLD = float(os.getenv("EDDI_SEVERE_DRY_THRESHOLD", "-1.5"))
+
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
@@ -75,6 +120,8 @@ class FVPointRequest(BaseModel):
     forecast_periods: Optional[List[str]] = None
     include_forecast_ensembles: bool = True
     workload_tag: Optional[str] = None
+    crop: Optional[str] = None
+    stage: Optional[str] = None
 
     @field_validator("forecast_periods")
     @classmethod
@@ -96,6 +143,26 @@ class FVPointRequest(BaseModel):
                 seen.add(key)
         return cleaned or None
 
+    @field_validator("crop")
+    @classmethod
+    def validate_crop(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = str(v).strip().lower()
+        if not value:
+            return None
+        if value not in SUPPORTED_CROPS:
+            raise ValueError(f"Unsupported crop '{v}'. Supported values: {', '.join(SUPPORTED_CROPS)}")
+        return value
+
+    @field_validator("stage")
+    @classmethod
+    def normalize_stage(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        value = str(v).strip().lower()
+        return value or None
+
 
 class FVPointResponse(BaseModel):
     meta: Dict[str, Any]
@@ -103,6 +170,8 @@ class FVPointResponse(BaseModel):
     drought_latest: Optional[Dict[str, Any]] = None
     noaa_monitoring: Optional[Dict[str, Any]] = None
     forecast_4week: Optional[Dict[str, Any]] = None
+    risk_analysis: Optional[Dict[str, Any]] = None
+    farmer_advice: Optional[List[Dict[str, Any]]] = None
     warnings: List[str] = Field(default_factory=list)
 
 
@@ -116,6 +185,8 @@ def root() -> Dict[str, Any]:
         "forecast_provider": "official-thredds-eddi",
         "backend_mode": "thredds-eddi-no-gee",
         "supported_forecast_periods": FORECAST_PERIODS_ALL,
+        "supported_crops": SUPPORTED_CROPS,
+        "crop_stage_options": CROP_STAGE_OPTIONS,
     }
 
 
@@ -129,6 +200,7 @@ def health() -> Dict[str, Any]:
         "backend_mode": "thredds-eddi-no-gee",
         "forecast_provider": "official-thredds-eddi",
         "forecast_periods_supported": FORECAST_PERIODS_ALL,
+        "supported_crops": SUPPORTED_CROPS,
     }
 
 
@@ -139,8 +211,23 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
     drought_latest = None
     noaa_monitoring = None
     forecast_4week = None
+    risk_analysis = None
+    farmer_advice = None
 
     try:
+        if req.crop and not req.stage:
+            warnings.append("Crop was provided but current stage was not provided, so farmer risk analysis was skipped.")
+        if req.stage and not req.crop:
+            warnings.append("Current stage was provided but crop was not provided, so farmer risk analysis was skipped.")
+        if req.crop and req.stage and req.stage not in CROP_STAGE_OPTIONS.get(req.crop, []):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unsupported stage '{req.stage}' for crop '{req.crop}'. "
+                    f"Supported stages: {', '.join(CROP_STAGE_OPTIONS[req.crop])}"
+                ),
+            )
+
         if req.include_weather_history:
             warnings.append(
                 "Weather history is not included in this backend because GEE has been removed."
@@ -156,14 +243,25 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
 
         if req.include_forecast_4week:
             periods = req.forecast_periods or FORECAST_PERIODS_ALL
+            need_ensembles_for_analysis = bool(req.crop and req.stage)
             forecast_4week = extract_official_forecast_eddi(
                 lat=req.lat,
                 lon=req.lon,
                 periods=periods,
-                include_ensembles=req.include_forecast_ensembles,
+                include_ensembles=(req.include_forecast_ensembles or need_ensembles_for_analysis),
             )
             if forecast_4week.get("status") != "ok":
                 warnings.append(str(forecast_4week.get("message") or "Forecast download did not complete normally."))
+            elif req.crop and req.stage:
+                risk_analysis = analyze_farmer_risk(
+                    forecast_4week=forecast_4week,
+                    noaa_monitoring=noaa_monitoring,
+                    crop=req.crop,
+                    stage=req.stage,
+                )
+                farmer_advice = build_farmer_advice(risk_analysis)
+                if not req.include_forecast_ensembles:
+                    forecast_4week["ensembles"] = None
 
     except HTTPException:
         raise
@@ -179,11 +277,15 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
             "workload_tag": req.workload_tag,
             "backend_mode": "thredds-eddi-no-gee",
             "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "crop": req.crop,
+            "stage": req.stage,
         },
         weather_daily=weather_daily,
         drought_latest=drought_latest,
         noaa_monitoring=noaa_monitoring,
         forecast_4week=forecast_4week,
+        risk_analysis=risk_analysis,
+        farmer_advice=farmer_advice,
         warnings=warnings,
     )
 
@@ -232,9 +334,7 @@ def _open_thredds_dataset(url: str):
     try:
         return xr.open_dataset(url, engine="pydap", decode_times=False)
     except Exception as exc:
-        raise RuntimeError(
-            f"Could not open THREDDS dataset with pydap: {url}. Error: {exc}"
-        ) from exc
+        raise RuntimeError(f"Could not open THREDDS dataset with pydap: {url}. Error: {exc}") from exc
 
 
 def _parse_http_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -413,3 +513,249 @@ def extract_official_forecast_eddi(
         "ensembles": ensemble_rows if include_ensembles else None,
         "files": file_rows,
     }
+
+
+def _stage_sensitivity_label(weight: float) -> str:
+    for min_weight, label in STAGE_SENSITIVITY_LABELS.items():
+        if weight >= min_weight:
+            return label
+    return "low"
+
+
+def _is_dry_signal(value: Optional[float], threshold: float) -> bool:
+    if value is None:
+        return False
+    if EDDI_DRY_DIRECTION == "positive":
+        return value >= abs(threshold)
+    return value <= threshold
+
+
+def _fraction_matching(values: List[Optional[float]], threshold: float) -> float:
+    finite = [float(v) for v in values if v is not None]
+    if not finite:
+        return 0.0
+    hits = sum(1 for v in finite if _is_dry_signal(v, threshold))
+    return hits / len(finite)
+
+
+def _confidence_from_spread(p25: Optional[float], p75: Optional[float]) -> str:
+    if p25 is None or p75 is None:
+        return "low"
+    spread = abs(float(p75) - float(p25))
+    if spread <= 0.75:
+        return "high"
+    if spread <= 1.5:
+        return "moderate"
+    return "low"
+
+
+def _signal_label(dry_fraction: float, severe_fraction: float, confidence: str) -> str:
+    if severe_fraction >= 0.40:
+        return "very_dry_week"
+    if dry_fraction >= 0.55:
+        return "dry_week"
+    if dry_fraction >= 0.30:
+        return "watch_week" if confidence == "low" else "dry_watch_week"
+    if dry_fraction <= 0.10:
+        return "near_normal_week"
+    return "mixed_signal_week"
+
+
+def _risk_from_score(score: float) -> str:
+    if score < 0.35:
+        return "low"
+    if score < 0.65:
+        return "moderate"
+    if score < 0.90:
+        return "high"
+    return "very_high"
+
+
+def _current_context_label(current_04wk_value: Optional[float]) -> str:
+    if current_04wk_value is None:
+        return "monitoring_unavailable"
+    if _is_dry_signal(current_04wk_value, DRY_THRESHOLD):
+        return "current_dry_signal_present"
+    return "current_signal_not_dry"
+
+
+def _trajectory_from_weeklies(weeklies: List[Dict[str, Any]]) -> Dict[str, str]:
+    week_order = {"wk1": 1, "wk2": 2, "wk3": 3, "wk4": 4}
+    rows = [w for w in weeklies if w.get("period") in week_order]
+    rows.sort(key=lambda r: week_order[r["period"]])
+    if not rows:
+        return {
+            "label": "not_available",
+            "summary": "Week-by-week trajectory is not available from the selected periods.",
+        }
+
+    dry_weeks = [r for r in rows if r.get("dry_member_fraction", 0) >= 0.55]
+    if len(dry_weeks) >= 3:
+        return {
+            "label": "persistent_dry_risk",
+            "summary": "The dryness signal persists across most of the week-by-week outlook.",
+        }
+    if rows[0].get("dry_member_fraction", 0) >= 0.55 and all(r.get("dry_member_fraction", 0) < 0.55 for r in rows[1:]):
+        return {
+            "label": "early_dry_risk",
+            "summary": "The strongest dryness risk appears early in the outlook and then weakens.",
+        }
+    if rows[-1].get("dry_member_fraction", 0) >= 0.55 and all(r.get("dry_member_fraction", 0) < 0.55 for r in rows[:-1]):
+        return {
+            "label": "late_dry_risk",
+            "summary": "The dryness signal becomes stronger later in the outlook.",
+        }
+    if all(r.get("dry_member_fraction", 0) < 0.30 for r in rows):
+        return {
+            "label": "limited_dry_risk",
+            "summary": "The week-by-week outlook shows limited dryness risk overall.",
+        }
+    return {
+        "label": "mixed_signal",
+        "summary": "The week-by-week outlook is mixed, so the dryness signal should be watched closely.",
+    }
+
+
+def analyze_farmer_risk(
+    forecast_4week: Dict[str, Any],
+    noaa_monitoring: Optional[Dict[str, Any]],
+    crop: str,
+    stage: str,
+) -> Dict[str, Any]:
+    summary_rows = forecast_4week.get("summary") or []
+    ensemble_rows = forecast_4week.get("ensembles") or []
+    stage_weight = STAGE_SENSITIVITY[crop][stage]
+    sensitivity_label = _stage_sensitivity_label(stage_weight)
+
+    ensemble_by_period: Dict[str, List[Optional[float]]] = {}
+    for row in ensemble_rows:
+        period = row.get("period")
+        if not period:
+            continue
+        ensemble_by_period.setdefault(period, []).append(row.get("eddi"))
+
+    weekly_rows: List[Dict[str, Any]] = []
+    combined_rows: Dict[str, Dict[str, Any]] = {}
+
+    for row in summary_rows:
+        period = str(row.get("period") or "")
+        values = ensemble_by_period.get(period, [])
+        dry_fraction = _fraction_matching(values, DRY_THRESHOLD) if values else 0.0
+        severe_fraction = _fraction_matching(values, SEVERE_DRY_THRESHOLD) if values else 0.0
+        confidence = _confidence_from_spread(row.get("eddi_p25"), row.get("eddi_p75"))
+        signal_label = _signal_label(dry_fraction, severe_fraction, confidence)
+        base_score = dry_fraction * 0.6 + severe_fraction * 0.4
+        adjusted_score = base_score * stage_weight
+        overall_risk = _risk_from_score(adjusted_score)
+
+        out_row = {
+            "period": period,
+            "issue_date": row.get("issue_date"),
+            "valid_start": row.get("valid_start"),
+            "valid_end": row.get("valid_end"),
+            "eddi_mean": row.get("eddi_mean"),
+            "eddi_median": row.get("eddi_median"),
+            "eddi_p25": row.get("eddi_p25"),
+            "eddi_p75": row.get("eddi_p75"),
+            "eddi_min": row.get("eddi_min"),
+            "eddi_max": row.get("eddi_max"),
+            "dry_member_fraction": round(dry_fraction, 4),
+            "severe_dry_member_fraction": round(severe_fraction, 4),
+            "confidence": confidence,
+            "signal_label": signal_label,
+            "overall_risk": overall_risk,
+            "stage_weight": round(stage_weight, 3),
+            "lat_grid": row.get("lat_grid"),
+            "lon_grid": row.get("lon_grid"),
+        }
+
+        if period in {"wk1", "wk2", "wk3", "wk4"}:
+            weekly_rows.append(out_row)
+        else:
+            combined_rows[period] = out_row
+
+    weekly_rows.sort(key=lambda r: {"wk1": 1, "wk2": 2, "wk3": 3, "wk4": 4}.get(r["period"], 99))
+    current_04wk = _safe_float((noaa_monitoring or {}).get("EDDI_ETrs_04wk"))
+    current_01mn = _safe_float((noaa_monitoring or {}).get("EDDI_ETrs_01mn"))
+
+    return {
+        "crop": crop,
+        "stage": stage,
+        "stage_sensitivity": sensitivity_label,
+        "stage_weight": round(stage_weight, 3),
+        "current_context": {
+            "noaa_monitoring_eddi_04wk": current_04wk,
+            "noaa_monitoring_eddi_01mn": current_01mn,
+            "status_label": _current_context_label(current_04wk),
+        },
+        "thresholds": {
+            "dry_threshold": DRY_THRESHOLD,
+            "severe_dry_threshold": SEVERE_DRY_THRESHOLD,
+            "dry_direction": EDDI_DRY_DIRECTION,
+        },
+        "weekly": weekly_rows,
+        "combined": combined_rows,
+        "trajectory": _trajectory_from_weeklies(weekly_rows),
+    }
+
+
+def build_farmer_advice(risk_analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    crop = risk_analysis.get("crop")
+    stage = risk_analysis.get("stage")
+    advice: List[Dict[str, Any]] = []
+
+    label_messages = {
+        "very_dry_week": "This period shows a strong dryness signal across many ensemble members.",
+        "dry_week": "This period shows elevated atmospheric moisture-stress risk.",
+        "dry_watch_week": "This period leans dry, although the signal is not fully settled.",
+        "watch_week": "The signal is mixed, so this period should be watched closely.",
+        "near_normal_week": "This period does not show a strong dryness signal.",
+        "mixed_signal_week": "This period has mixed ensemble outcomes, so confidence is limited.",
+    }
+
+    for row in risk_analysis.get("weekly", []):
+        period = row.get("period")
+        signal_label = row.get("signal_label")
+        overall_risk = row.get("overall_risk")
+        base_msg = label_messages.get(signal_label, "This period should be monitored.")
+        message = f"{base_msg} For {crop} in the {stage} stage, overall field stress risk is {overall_risk}."
+        advice.append({
+            "period": period,
+            "label": signal_label,
+            "overall_risk": overall_risk,
+            "message": message,
+        })
+
+    wk12 = (risk_analysis.get("combined") or {}).get("wk12")
+    if wk12:
+        advice.append({
+            "period": "wk12",
+            "label": "two_week_view",
+            "overall_risk": wk12.get("overall_risk"),
+            "message": (
+                f"The 2-week outlook for {crop} in the {stage} stage is {wk12.get('overall_risk')} risk, "
+                "which is useful for short-term planning."
+            ),
+        })
+
+    wk1234 = (risk_analysis.get("combined") or {}).get("wk1234")
+    if wk1234:
+        advice.append({
+            "period": "wk1234",
+            "label": "four_week_view",
+            "overall_risk": wk1234.get("overall_risk"),
+            "message": (
+                f"The 4-week integrated outlook for {crop} in the {stage} stage is {wk1234.get('overall_risk')} risk."
+            ),
+        })
+
+    trajectory = risk_analysis.get("trajectory") or {}
+    if trajectory.get("label") and trajectory.get("label") != "not_available":
+        advice.append({
+            "period": "trajectory",
+            "label": trajectory.get("label"),
+            "overall_risk": None,
+            "message": trajectory.get("summary"),
+        })
+
+    return advice
