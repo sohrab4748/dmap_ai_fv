@@ -100,10 +100,16 @@ DRY_THRESHOLD = float(os.getenv("EDDI_DRY_THRESHOLD", "-1.0"))
 SEVERE_DRY_THRESHOLD = float(os.getenv("EDDI_SEVERE_DRY_THRESHOLD", "-1.5"))
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+origins = [
+    x.strip()
+    for x in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if x.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOW_ORIGINS,
-    allow_credentials=False if CORS_ALLOW_ORIGINS == ["*"] else True,
+    allow_origins=origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
