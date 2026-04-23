@@ -252,7 +252,7 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
             )
             if forecast_4week.get("status") != "ok":
                 warnings.append(str(forecast_4week.get("message") or "Forecast download did not complete normally."))
-            elif req.crop and req.stage:
+            if req.crop and req.stage and forecast_4week.get("summary"):
                 risk_analysis = analyze_farmer_risk(
                     forecast_4week=forecast_4week,
                     noaa_monitoring=noaa_monitoring,
@@ -414,86 +414,97 @@ def extract_official_forecast_eddi(
     ensemble_rows: List[Dict[str, Any]] = []
     file_rows: List[Dict[str, Any]] = []
     issue_dates: List[str] = []
+    period_errors: List[Dict[str, str]] = []
 
     for period in periods:
         if period not in FORECAST_PERIOD_FILES:
             raise RuntimeError(f"Unsupported forecast period: {period}")
 
         url = f"{FORECAST_BASE_ODAP}/{FORECAST_PERIOD_FILES[period]}"
-        ds = _open_thredds_dataset(url)
+
         try:
-            var_name = _find_data_var_name(ds)
-            lat_name = _find_coord_name(ds, ["lat", "latitude", "y"])
-            lon_name = _find_coord_name(ds, ["lon", "longitude", "x"])
-            if not lat_name or not lon_name:
-                raise RuntimeError(f"Could not detect lat/lon coordinate names in {url}")
+            ds = _open_thredds_dataset(url)
+            try:
+                var_name = _find_data_var_name(ds)
+                lat_name = _find_coord_name(ds, ["lat", "latitude", "y"])
+                lon_name = _find_coord_name(ds, ["lon", "longitude", "x"])
+                if not lat_name or not lon_name:
+                    raise RuntimeError(f"Could not detect lat/lon coordinate names in {url}")
 
-            da = ds[var_name].sel({lat_name: lat, lon_name: lon}, method="nearest")
-            values = np.asarray(da.values, dtype=float).reshape(-1)
-            values_finite = values[np.isfinite(values)]
-            n_members = int(values.size)
-            n_finite = int(values_finite.size)
+                da = ds[var_name].sel({lat_name: lat, lon_name: lon}, method="nearest")
+                values = np.asarray(da.values, dtype=float).reshape(-1)
+                values_finite = values[np.isfinite(values)]
+                n_members = int(values.size)
+                n_finite = int(values_finite.size)
 
-            lat_grid = _safe_float(da[lat_name].values)
-            lon_grid = _safe_float(da[lon_name].values)
+                lat_grid = _safe_float(da[lat_name].values)
+                lon_grid = _safe_float(da[lon_name].values)
 
-            issue_dt = _fetch_file_issue_datetime(period)
-            issue_date = (issue_dt.date() if issue_dt else datetime.now(timezone.utc).date())
-            issue_date_iso = issue_date.isoformat()
-            issue_dates.append(issue_date_iso)
+                issue_dt = _fetch_file_issue_datetime(period)
+                issue_date = (issue_dt.date() if issue_dt else datetime.now(timezone.utc).date())
+                issue_date_iso = issue_date.isoformat()
+                issue_dates.append(issue_date_iso)
 
-            start_day, end_day = FORECAST_PERIOD_WINDOWS[period]
-            valid_start = (issue_date + timedelta(days=start_day)).isoformat()
-            valid_end = (issue_date + timedelta(days=end_day)).isoformat()
+                start_day, end_day = FORECAST_PERIOD_WINDOWS[period]
+                valid_start = (issue_date + timedelta(days=start_day)).isoformat()
+                valid_end = (issue_date + timedelta(days=end_day)).isoformat()
 
-            summary_rows.append({
-                "period": period,
-                "issue_date": issue_date_iso,
-                "valid_start": valid_start,
-                "valid_end": valid_end,
-                "n_members": n_members,
-                "n_finite": n_finite,
-                "eddi_mean": float(np.mean(values_finite)) if n_finite else None,
-                "eddi_median": float(np.median(values_finite)) if n_finite else None,
-                "eddi_min": float(np.min(values_finite)) if n_finite else None,
-                "eddi_max": float(np.max(values_finite)) if n_finite else None,
-                "eddi_p25": float(np.percentile(values_finite, 25)) if n_finite else None,
-                "eddi_p75": float(np.percentile(values_finite, 75)) if n_finite else None,
-                "lat_req": lat,
-                "lon_req": lon,
-                "lat_grid": lat_grid,
-                "lon_grid": lon_grid,
-            })
+                summary_rows.append({
+                    "period": period,
+                    "issue_date": issue_date_iso,
+                    "valid_start": valid_start,
+                    "valid_end": valid_end,
+                    "n_members": n_members,
+                    "n_finite": n_finite,
+                    "eddi_mean": float(np.mean(values_finite)) if n_finite else None,
+                    "eddi_median": float(np.median(values_finite)) if n_finite else None,
+                    "eddi_min": float(np.min(values_finite)) if n_finite else None,
+                    "eddi_max": float(np.max(values_finite)) if n_finite else None,
+                    "eddi_p25": float(np.percentile(values_finite, 25)) if n_finite else None,
+                    "eddi_p75": float(np.percentile(values_finite, 75)) if n_finite else None,
+                    "lat_req": lat,
+                    "lon_req": lon,
+                    "lat_grid": lat_grid,
+                    "lon_grid": lon_grid,
+                })
 
-            file_rows.append({
+                file_rows.append({
+                    "period": period,
+                    "url": url,
+                    "filename": FORECAST_PERIOD_FILES[period],
+                    "issue_date": issue_date_iso,
+                    "valid_start": valid_start,
+                    "valid_end": valid_end,
+                    "n_members": n_members,
+                })
+
+                if include_ensembles:
+                    for idx, val in enumerate(values, start=1):
+                        ensemble_rows.append({
+                            "period": period,
+                            "issue_date": issue_date_iso,
+                            "valid_start": valid_start,
+                            "valid_end": valid_end,
+                            "ensemble_member": idx,
+                            "eddi": float(val) if np.isfinite(val) else None,
+                            "lat_req": lat,
+                            "lon_req": lon,
+                            "lat_grid": lat_grid,
+                            "lon_grid": lon_grid,
+                        })
+            finally:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Skipping forecast period %s due to remote access error: %s", period, exc)
+            period_errors.append({
                 "period": period,
                 "url": url,
-                "filename": FORECAST_PERIOD_FILES[period],
-                "issue_date": issue_date_iso,
-                "valid_start": valid_start,
-                "valid_end": valid_end,
-                "n_members": n_members,
+                "error": str(exc),
             })
-
-            if include_ensembles:
-                for idx, val in enumerate(values, start=1):
-                    ensemble_rows.append({
-                        "period": period,
-                        "issue_date": issue_date_iso,
-                        "valid_start": valid_start,
-                        "valid_end": valid_end,
-                        "ensemble_member": idx,
-                        "eddi": float(val) if np.isfinite(val) else None,
-                        "lat_req": lat,
-                        "lon_req": lon,
-                        "lat_grid": lat_grid,
-                        "lon_grid": lon_grid,
-                    })
-        finally:
-            try:
-                ds.close()
-            except Exception:
-                pass
+            continue
 
     if not summary_rows:
         return {
@@ -501,17 +512,26 @@ def extract_official_forecast_eddi(
             "status": "no_data",
             "message": "No official THREDDS EDDI forecast rows were returned.",
             "requested_periods": periods,
+            "period_errors": period_errors,
         }
+
+    status = "partial" if period_errors else "ok"
+    message = None
+    if period_errors:
+        failed = ", ".join(err["period"] for err in period_errors)
+        message = f"Some forecast periods could not be loaded from THREDDS: {failed}"
 
     return {
         "provider": "official-thredds-eddi",
-        "status": "ok",
+        "status": status,
         "base_odap_url": FORECAST_BASE_ODAP,
         "requested_periods": periods,
         "issue_dates": sorted(set(issue_dates)),
         "summary": summary_rows,
         "ensembles": ensemble_rows if include_ensembles else None,
         "files": file_rows,
+        "period_errors": period_errors,
+        "message": message,
     }
 
 
