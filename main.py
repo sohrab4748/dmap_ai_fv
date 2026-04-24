@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
@@ -13,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.6.1-thredds-eddi-farmer-risk-dap2"
+APP_VERSION = "0.7.0-thredds-eddi-farmer-risk-fileserver"
 
 _raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
 if _raw_origins == "*":
@@ -53,7 +54,8 @@ FORECAST_BASE_FILESERVER = os.getenv(
     "NWCSC_INTEGRATED_SCENARIOS_ALL_CLIMATE/cfsv2_metdata_90day",
 ).rstrip("/")
 THREDDS_TIMEOUT_SECONDS = int(os.getenv("THREDDS_TIMEOUT_SECONDS", "90"))
-THREDDS_DAP_PROTOCOL = os.getenv("THREDDS_DAP_PROTOCOL", "dap2").strip().lower()
+THREDDS_CONNECT_TIMEOUT_SECONDS = int(os.getenv("THREDDS_CONNECT_TIMEOUT_SECONDS", "20"))
+THREDDS_READ_TIMEOUT_SECONDS = int(os.getenv("THREDDS_READ_TIMEOUT_SECONDS", "90"))
 
 SUPPORTED_CROPS = ["corn", "soybean"]
 CROP_STAGE_OPTIONS = {
@@ -183,12 +185,11 @@ def root() -> Dict[str, Any]:
         "version": APP_VERSION,
         "gee_initialized": False,
         "gee_enabled": False,
-        "forecast_provider": "official-thredds-eddi",
-        "backend_mode": "thredds-eddi-no-gee",
+        "forecast_provider": "official-thredds-eddi-fileserver",
+        "backend_mode": "thredds-eddi-fileserver-no-gee",
         "supported_forecast_periods": FORECAST_PERIODS_ALL,
         "supported_crops": SUPPORTED_CROPS,
         "crop_stage_options": CROP_STAGE_OPTIONS,
-        "thredds_dap_protocol": THREDDS_DAP_PROTOCOL,
     }
 
 
@@ -199,11 +200,10 @@ def health() -> Dict[str, Any]:
         "gee_initialized": False,
         "gee_enabled": False,
         "gee_error": None,
-        "backend_mode": "thredds-eddi-no-gee",
-        "forecast_provider": "official-thredds-eddi",
+        "backend_mode": "thredds-eddi-fileserver-no-gee",
+        "forecast_provider": "official-thredds-eddi-fileserver",
         "forecast_periods_supported": FORECAST_PERIODS_ALL,
         "supported_crops": SUPPORTED_CROPS,
-        "thredds_dap_protocol": THREDDS_DAP_PROTOCOL,
     }
 
 
@@ -278,7 +278,7 @@ def fv_point(req: FVPointRequest) -> FVPointResponse:
             "lon": req.lon,
             "history_days": req.history_days,
             "workload_tag": req.workload_tag,
-            "backend_mode": "thredds-eddi-no-gee",
+            "backend_mode": "thredds-eddi-fileserver-no-gee",
             "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "crop": req.crop,
             "stage": req.stage,
@@ -326,16 +326,6 @@ def fetch_noaa_monitoring_eddi(lat: float, lon: float) -> Dict[str, Any]:
     return out
 
 
-def _to_explicit_dap_url(url: str) -> str:
-    if url.startswith("dap2://") or url.startswith("dap4://"):
-        return url
-    if THREDDS_DAP_PROTOCOL in {"dap2", "dap4"} and url.startswith("http://"):
-        return f"{THREDDS_DAP_PROTOCOL}://" + url[len("http://"):]
-    if THREDDS_DAP_PROTOCOL in {"dap2", "dap4"} and url.startswith("https://"):
-        return f"{THREDDS_DAP_PROTOCOL}://" + url[len("https://"):]
-    return url
-
-
 def _open_thredds_dataset(url: str):
     try:
         import xarray as xr
@@ -367,7 +357,7 @@ def _parse_http_datetime(value: Optional[str]) -> Optional[datetime]:
 def _fetch_file_issue_datetime(period: str) -> Optional[datetime]:
     url = f"{FORECAST_BASE_FILESERVER}/{FORECAST_PERIOD_FILES[period]}"
     try:
-        resp = requests.head(url, timeout=THREDDS_TIMEOUT_SECONDS, allow_redirects=True)
+        resp = requests.head(url, timeout=(THREDDS_CONNECT_TIMEOUT_SECONDS, THREDDS_READ_TIMEOUT_SECONDS), allow_redirects=True)
         resp.raise_for_status()
         dt = _parse_http_datetime(resp.headers.get("Last-Modified"))
         if dt is not None:
@@ -376,7 +366,7 @@ def _fetch_file_issue_datetime(period: str) -> Optional[datetime]:
         logger.warning("HEAD request failed for %s: %s", url, exc)
 
     try:
-        resp = requests.get(url, timeout=THREDDS_TIMEOUT_SECONDS, stream=True)
+        resp = requests.get(url, timeout=(THREDDS_CONNECT_TIMEOUT_SECONDS, THREDDS_READ_TIMEOUT_SECONDS), stream=True)
         resp.raise_for_status()
         dt = _parse_http_datetime(resp.headers.get("Last-Modified"))
         resp.close()
@@ -434,9 +424,11 @@ def extract_official_forecast_eddi(
             raise RuntimeError(f"Unsupported forecast period: {period}")
 
         url = f"{FORECAST_BASE_ODAP}/{FORECAST_PERIOD_FILES[period]}"
+        file_url = f"{FORECAST_BASE_FILESERVER}/{FORECAST_PERIOD_FILES[period]}"
 
         try:
-            ds = _open_thredds_dataset(url)
+            local_path = _download_forecast_file(period)
+            ds = _open_thredds_dataset(local_path)
             try:
                 var_name = _find_data_var_name(ds)
                 lat_name = _find_coord_name(ds, ["lat", "latitude", "y"])
@@ -484,7 +476,7 @@ def extract_official_forecast_eddi(
                 file_rows.append({
                     "period": period,
                     "url": url,
-                    "dap_url": _to_explicit_dap_url(url),
+                    "file_url": file_url,
                     "filename": FORECAST_PERIOD_FILES[period],
                     "issue_date": issue_date_iso,
                     "valid_start": valid_start,
@@ -511,11 +503,16 @@ def extract_official_forecast_eddi(
                     ds.close()
                 except Exception:
                     pass
+                try:
+                    os.unlink(local_path)
+                except Exception:
+                    pass
         except Exception as exc:
             logger.warning("Skipping forecast period %s due to remote access error: %s", period, exc)
             period_errors.append({
                 "period": period,
                 "url": url,
+                "file_url": file_url,
                 "error": str(exc),
             })
             continue
@@ -539,6 +536,7 @@ def extract_official_forecast_eddi(
         "provider": "official-thredds-eddi",
         "status": status,
         "base_odap_url": FORECAST_BASE_ODAP,
+        "base_fileserver_url": FORECAST_BASE_FILESERVER,
         "requested_periods": periods,
         "issue_dates": sorted(set(issue_dates)),
         "summary": summary_rows,
