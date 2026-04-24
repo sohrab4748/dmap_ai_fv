@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dmap_ai_fv_backend")
 
 APP_TITLE = "DMAP-AI / FV Backend"
-APP_VERSION = "0.7.0-thredds-eddi-farmer-risk-fileserver"
+APP_VERSION = "0.7.1-thredds-eddi-farmer-risk-fileserver-fixed"
 
 _raw_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").strip()
 if _raw_origins == "*":
@@ -326,18 +326,56 @@ def fetch_noaa_monitoring_eddi(lat: float, lon: float) -> Dict[str, Any]:
     return out
 
 
-def _open_thredds_dataset(url: str):
+def _download_forecast_file(period: str) -> str:
+    url = f"{FORECAST_BASE_FILESERVER}/{FORECAST_PERIOD_FILES[period]}"
+    suffix = f"_{FORECAST_PERIOD_FILES[period]}"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(THREDDS_CONNECT_TIMEOUT_SECONDS, THREDDS_READ_TIMEOUT_SECONDS),
+        ) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    tmp.write(chunk)
+        tmp.close()
+        return tmp_path
+    except Exception:
+        try:
+            tmp.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _open_thredds_dataset(local_path: str):
     try:
         import xarray as xr
     except Exception as exc:
         raise RuntimeError(
-            "xarray is required for forecast download. Install xarray, pydap, and Jinja2 in the backend environment."
+            "xarray is required for forecast download. Install xarray and h5netcdf in the backend environment."
         ) from exc
 
-    try:
-        return xr.open_dataset(url, engine="pydap", decode_times=False)
-    except Exception as exc:
-        raise RuntimeError(f"Could not open THREDDS dataset with pydap: {url}. Error: {exc}") from exc
+    last_exc = None
+    for engine in ("h5netcdf", None):
+        try:
+            if engine:
+                return xr.open_dataset(local_path, engine=engine, decode_times=False)
+            return xr.open_dataset(local_path, decode_times=False)
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    raise RuntimeError(
+        f"Could not open downloaded forecast dataset: {local_path}. Error: {last_exc}"
+    ) from last_exc
 
 
 def _parse_http_datetime(value: Optional[str]) -> Optional[datetime]:
