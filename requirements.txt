@@ -3,6 +3,6 @@ uvicorn[standard]==0.34.0
 pydantic==2.13.0
 requests==2.32.3
 xarray==2025.3.1
-pydap==3.5.9
-Jinja2==3.1.6
+h5netcdf==1.6.1
+h5py==3.13.0
 numpy==2.2.4
